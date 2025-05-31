@@ -1,32 +1,79 @@
-const hre = require("hardhat")
-require("dotenv").config()
+require("dotenv").config();
+const ethers = require("ethers");
 
-const config = require('../config.json')
-const IUniswapV2Router02 = require('@uniswap/v2-periphery/build/IUniswapV2Router02.json')
-const IUniswapV2Factory = require("@uniswap/v2-core/build/IUniswapV2Factory.json")
+const config = require("../config.json");
+const arbitrageAbi = require("../artifacts/contracts/Arbitrage.sol/Arbitrage.json");
 
-let provider
+// -- PROVIDER -- //
+const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL);
 
-if (config.PROJECT_SETTINGS.isLocal) {
-  provider = new hre.ethers.providers.WebSocketProvider(`ws://127.0.0.1:8545/`)
-} else {
-  provider = new hre.ethers.providers.WebSocketProvider(`wss://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`)
-}
+// -- INTERFACES -- //
+const IUniswapV2Router02 = require("@uniswap/v2-periphery/build/IUniswapV2Router02.json");
+const IUniswapV2Factory = require("@uniswap/v2-core/build/IUniswapV2Factory.json");
 
-// -- SETUP UNISWAP/SUSHISWAP CONTRACTS -- //
-const uFactory = new hre.ethers.Contract(config.UNISWAP.FACTORY_ADDRESS, IUniswapV2Factory.abi, provider)
-const uRouter = new hre.ethers.Contract(config.UNISWAP.V2_ROUTER_02_ADDRESS, IUniswapV2Router02.abi, provider)
-const sFactory = new hre.ethers.Contract(config.SUSHISWAP.FACTORY_ADDRESS, IUniswapV2Factory.abi, provider)
-const sRouter = new hre.ethers.Contract(config.SUSHISWAP.V2_ROUTER_02_ADDRESS, IUniswapV2Router02.abi, provider)
+// LB Router ABI (simplified)
+const LB_ROUTER_ABI = [
+  "function getSwapIn(address tokenA, address tokenB, uint128 amountOut) external view returns (uint128 amountIn, uint128 amountOutLeft, uint128 fee)",
+  "function getSwapOut(address tokenA, address tokenB, uint128 amountIn) external view returns (uint128 amountOut, uint128 amountOutLeft, uint128 fee)",
+  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, uint256[] calldata pairBinSteps, address[] calldata path, address to, uint256 deadline) external returns (uint256 amountOut)",
+];
 
-const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
-const arbitrage = new hre.ethers.Contract(config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS, IArbitrage.abi, provider)
+// -- CONTRACTS -- //
+// Trader Joe V2 (Traditional)
+const tjFactory = new ethers.Contract(
+  config.TRADERJOE.V2_FACTORY_ADDRESS,
+  IUniswapV2Factory.abi,
+  provider
+);
+
+const tjRouter = new ethers.Contract(
+  config.TRADERJOE.V2_ROUTER_ADDRESS,
+  IUniswapV2Router02.abi,
+  provider
+);
+
+// Trader Joe V2.2 (Liquidity Book)
+const tjLBFactory = new ethers.Contract(
+  config.TRADERJOE.LB_FACTORY_ADDRESS,
+  [
+    "function getLBPairInformation(address tokenA, address tokenB, uint256 binStep) external view returns (address lbPair, bool createdByOwner, bool ignoredForRouting)",
+  ],
+  provider
+);
+
+const tjLBRouter = new ethers.Contract(
+  config.TRADERJOE.LB_ROUTER_ADDRESS,
+  LB_ROUTER_ABI,
+  provider
+);
+
+// Pangolin V2
+const pFactory = new ethers.Contract(
+  config.PANGOLIN.V2_FACTORY_ADDRESS,
+  IUniswapV2Factory.abi,
+  provider
+);
+
+const pRouter = new ethers.Contract(
+  config.PANGOLIN.V2_ROUTER_ADDRESS,
+  IUniswapV2Router02.abi,
+  provider
+);
+
+// -- ARBITRAGE CONTRACT -- //
+const arbitrage = new ethers.Contract(
+  config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS,
+  arbitrageAbi.abi,
+  provider
+);
 
 module.exports = {
   provider,
-  uFactory,
-  uRouter,
-  sFactory,
-  sRouter,
-  arbitrage
-}
+  tjFactory,
+  tjRouter,
+  tjLBFactory,
+  tjLBRouter,
+  pFactory,
+  pRouter,
+  arbitrage,
+};

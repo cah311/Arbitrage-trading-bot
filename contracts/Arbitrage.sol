@@ -1,275 +1,224 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.10;
 
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-interface Structs {
-    struct Val {
-        uint256 value;
+// Trader Joe V2.2 Liquidity Book interfaces
+interface ILBRouter {
+    struct Path {
+        uint256[] pairBinSteps;
+        IERC20[] tokenPath;
     }
-
-    enum ActionType {
-        Deposit, // supply tokens
-        Withdraw, // borrow tokens
-        Transfer, // transfer balance between accounts
-        Buy, // buy an amount of some token (externally)
-        Sell, // sell an amount of some token (externally)
-        Trade, // trade tokens against another account
-        Liquidate, // liquidate an undercollateralized or expiring account
-        Vaporize, // use excess tokens to zero-out a completely negative account
-        Call // send arbitrary data to an address
-    }
-
-    enum AssetDenomination {
-        Wei // the amount is denominated in wei
-    }
-
-    enum AssetReference {
-        Delta // the amount is given as a delta from the current value
-    }
-
-    struct AssetAmount {
-        bool sign; // true if positive
-        AssetDenomination denomination;
-        AssetReference ref;
-        uint256 value;
-    }
-
-    struct ActionArgs {
-        ActionType actionType;
-        uint256 accountId;
-        AssetAmount amount;
-        uint256 primaryMarketId;
-        uint256 secondaryMarketId;
-        address otherAddress;
-        uint256 otherAccountId;
-        bytes data;
-    }
-
-    struct Info {
-        address owner; // The address that owns the account
-        uint256 number; // A nonce that allows a single address to control many accounts
-    }
-
-    struct Wei {
-        bool sign; // true if positive
-        uint256 value;
-    }
+    
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Path memory path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountOut);
+    
+    function getSwapOut(
+        address pair,
+        uint128 amountIn,
+        bool swapForY
+    ) external view returns (uint128 amountInLeft, uint128 amountOut, uint128 fee);
 }
 
-abstract contract DyDxPool is Structs {
-    function getAccountWei(Info memory account, uint256 marketId)
-        public
-        view
-        virtual
-        returns (Wei memory);
-
-    function operate(Info[] memory, ActionArgs[] memory) public virtual;
+interface ILBFactory {
+    function getLBPairInformation(
+        IERC20 tokenA,
+        IERC20 tokenB,
+        uint256 binStep
+    ) external view returns (
+        address lbPair,
+        bool createdByOwner,
+        bool ignoredForRouting
+    );
 }
 
-contract DyDxFlashLoan is Structs {
-    DyDxPool pool = DyDxPool(0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e);
-
-    address public WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-    mapping(address => uint256) public currencies;
-
-    constructor() {
-        currencies[WETH] = 1;
-    }
-
-    modifier onlyPool() {
-        require(
-            msg.sender == address(pool),
-            "FlashLoan: could be called by DyDx pool only"
-        );
-        _;
-    }
-
-    function tokenToMarketId(address token) public view returns (uint256) {
-        uint256 marketId = currencies[token];
-        require(marketId != 0, "FlashLoan: Unsupported token");
-        return marketId - 1;
-    }
-
-    // the DyDx will call `callFunction(address sender, Info memory accountInfo, bytes memory data) public` after during `operate` call
-    function flashloan(
-        address token,
+// Aave V3 interfaces
+interface IPool {
+    function flashLoanSimple(
+        address receiverAddress,
+        address asset,
         uint256 amount,
-        bytes memory data
-    ) internal {
-        IERC20(token).approve(address(pool), amount + 1);
-        Info[] memory infos = new Info[](1);
-        ActionArgs[] memory args = new ActionArgs[](3);
-
-        infos[0] = Info(address(this), 0);
-
-        AssetAmount memory wamt = AssetAmount(
-            false,
-            AssetDenomination.Wei,
-            AssetReference.Delta,
-            amount
-        );
-        ActionArgs memory withdraw;
-        withdraw.actionType = ActionType.Withdraw;
-        withdraw.accountId = 0;
-        withdraw.amount = wamt;
-        withdraw.primaryMarketId = tokenToMarketId(token);
-        withdraw.otherAddress = address(this);
-
-        args[0] = withdraw;
-
-        ActionArgs memory call;
-        call.actionType = ActionType.Call;
-        call.accountId = 0;
-        call.otherAddress = address(this);
-        call.data = data;
-
-        args[1] = call;
-
-        ActionArgs memory deposit;
-        AssetAmount memory damt = AssetAmount(
-            true,
-            AssetDenomination.Wei,
-            AssetReference.Delta,
-            amount + 1
-        );
-        deposit.actionType = ActionType.Deposit;
-        deposit.accountId = 0;
-        deposit.amount = damt;
-        deposit.primaryMarketId = tokenToMarketId(token);
-        deposit.otherAddress = address(this);
-
-        args[2] = deposit;
-
-        pool.operate(infos, args);
-    }
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
 }
 
-contract Arbitrage is DyDxFlashLoan {
-    IUniswapV2Router02 public immutable sRouter;
-    IUniswapV2Router02 public immutable uRouter;
+interface IFlashLoanSimpleReceiver {
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool);
+}
+
+contract Arbitrage is IFlashLoanSimpleReceiver {
+    ILBRouter public immutable lbRouter;      // Trader Joe LB Router
+    IUniswapV2Router02 public immutable pRouter;  // Pangolin Router (still V2)
+    ILBFactory public immutable lbFactory;    // Trader Joe LB Factory
+    IPool public immutable POOL;
 
     address public owner;
+    uint256 public constant DEFAULT_BIN_STEP = 25; // 0.25% bin step
 
-    constructor(address _sRouter, address _uRouter) {
-        sRouter = IUniswapV2Router02(_sRouter); // Sushiswap
-        uRouter = IUniswapV2Router02(_uRouter); // Uniswap
+    constructor(
+        address _lbRouter,
+        address _lbFactory, 
+        address _pRouter,
+        address _poolAddress
+    ) {
+        lbRouter = ILBRouter(_lbRouter);
+        lbFactory = ILBFactory(_lbFactory);
+        pRouter = IUniswapV2Router02(_pRouter);
+        POOL = IPool(_poolAddress);
         owner = msg.sender;
     }
 
     function executeTrade(
-        bool _startOnUniswap,
+        bool _startOnTraderJoe,
         address _token0,
         address _token1,
         uint256 _flashAmount
     ) external {
-        uint256 balanceBefore = IERC20(_token0).balanceOf(address(this));
-
         bytes memory data = abi.encode(
-            _startOnUniswap,
+            _startOnTraderJoe,
             _token0,
             _token1,
-            _flashAmount,
-            balanceBefore
+            _flashAmount
         );
 
-        flashloan(_token0, _flashAmount, data); // execution goes to `callFunction`
+        POOL.flashLoanSimple(
+            address(this),
+            _token0,
+            _flashAmount,
+            data,
+            0
+        );
     }
 
-    function callFunction(
-        address, /* sender */
-        Info calldata, /* accountInfo */
-        bytes calldata data
-    ) external onlyPool {
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(msg.sender == address(POOL), "FlashLoan: could be called by Aave pool only");
+        
         (
-            bool startOnUniswap,
+            bool startOnTraderJoe,
             address token0,
             address token1,
-            uint256 flashAmount,
-            uint256 balanceBefore
-        ) = abi.decode(data, (bool, address, address, uint256, uint256));
+            uint256 flashAmount
+        ) = abi.decode(params, (bool, address, address, uint256));
 
-        uint256 balanceAfter = IERC20(token0).balanceOf(address(this));
+        if (startOnTraderJoe) {
+            // Swap on Trader Joe LB first
+            _swapOnTraderJoe(token0, token1, flashAmount, 0);
 
-        require(
-            balanceAfter - balanceBefore == flashAmount,
-            "contract did not get the loan"
-        );
-
-        // Use the money here!
+            // Then swap back on Pangolin
         address[] memory path = new address[](2);
-
-        path[0] = token0;
-        path[1] = token1;
-
-        if (startOnUniswap) {
-            _swapOnUniswap(path, flashAmount, 0);
-
             path[0] = token1;
             path[1] = token0;
 
-            _swapOnSushiswap(
+            _swapOnPangolin(
                 path,
                 IERC20(token1).balanceOf(address(this)),
-                (flashAmount + 1)
+                flashAmount + premium
             );
         } else {
-            _swapOnSushiswap(path, flashAmount, 0);
+            // Swap on Pangolin first
+            address[] memory path = new address[](2);
+            path[0] = token0;
+            path[1] = token1;
+            
+            _swapOnPangolin(path, flashAmount, 0);
 
-            path[0] = token1;
-            path[1] = token0;
-
-            _swapOnUniswap(
-                path,
+            // Then swap back on Trader Joe LB
+            _swapOnTraderJoe(
+                token1,
+                token0, 
                 IERC20(token1).balanceOf(address(this)),
-                (flashAmount + 1)
+                flashAmount + premium
             );
         }
 
-        IERC20(token0).transfer(
-            owner,
-            IERC20(token0).balanceOf(address(this)) - (flashAmount + 1)
-        );
+        // Approve the pool to pull the funds
+        uint256 amountToRepay = flashAmount + premium;
+        IERC20(asset).approve(address(POOL), amountToRepay);
+
+        // Transfer profit to owner
+        uint256 profit = IERC20(asset).balanceOf(address(this)) - amountToRepay;
+        if (profit > 0) {
+            IERC20(asset).transfer(owner, profit);
+        }
+
+        return true;
     }
 
     // -- INTERNAL FUNCTIONS -- //
 
-    function _swapOnUniswap(
-        address[] memory _path,
+    function _swapOnTraderJoe(
+        address _tokenIn,
+        address _tokenOut,
         uint256 _amountIn,
-        uint256 _amountOut
+        uint256 _amountOutMin
     ) internal {
         require(
-            IERC20(_path[0]).approve(address(uRouter), _amountIn),
-            "Uniswap approval failed."
+            IERC20(_tokenIn).approve(address(lbRouter), _amountIn),
+            "Trader Joe LB approval failed."
         );
 
-        uRouter.swapExactTokensForTokens(
+        // Create LB path with default bin step
+        uint256[] memory pairBinSteps = new uint256[](1);
+        pairBinSteps[0] = DEFAULT_BIN_STEP;
+        
+        IERC20[] memory tokenPath = new IERC20[](2);
+        tokenPath[0] = IERC20(_tokenIn);
+        tokenPath[1] = IERC20(_tokenOut);
+
+        ILBRouter.Path memory lbPath = ILBRouter.Path({
+            pairBinSteps: pairBinSteps,
+            tokenPath: tokenPath
+        });
+
+        lbRouter.swapExactTokensForTokens(
             _amountIn,
-            _amountOut,
-            _path,
+            _amountOutMin,
+            lbPath,
             address(this),
-            (block.timestamp + 1200)
+            block.timestamp + 1200
         );
     }
 
-    function _swapOnSushiswap(
+    function _swapOnPangolin(
         address[] memory _path,
         uint256 _amountIn,
-        uint256 _amountOut
+        uint256 _amountOutMin
     ) internal {
         require(
-            IERC20(_path[0]).approve(address(sRouter), _amountIn),
-            "Sushiswap approval failed."
+            IERC20(_path[0]).approve(address(pRouter), _amountIn),
+            "Pangolin approval failed."
         );
 
-        sRouter.swapExactTokensForTokens(
+        pRouter.swapExactTokensForTokens(
             _amountIn,
-            _amountOut,
+            _amountOutMin,
             _path,
             address(this),
-            (block.timestamp + 1200)
+            block.timestamp + 1200
         );
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
+        _;
     }
 }
