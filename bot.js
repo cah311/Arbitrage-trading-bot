@@ -7,19 +7,14 @@ const config = require("./config.json");
 const {
   getTokenAndContract,
   getPairContract,
-  getLBPairContract,
   getReserves,
-  getLBPrice,
   calculatePrice,
   simulate,
-  simulateLB,
 } = require("./helpers/helpers");
 const {
   provider,
   tjFactory,
   tjRouter,
-  tjLBFactory,
-  tjLBRouter,
   pFactory,
   pRouter,
   arbitrage,
@@ -33,22 +28,19 @@ const difference = process.env.PRICE_DIFFERENCE;
 const gasLimit = process.env.GAS_LIMIT;
 const gasPrice = process.env.GAS_PRICE;
 
-let tjLBPair, pPair, amount;
+let tjPair, pPair, amount;
 let isExecuting = false;
 
 const main = async () => {
   const { token0Contract, token1Contract, token0, token1 } =
     await getTokenAndContract(arbFor, arbAgainst, provider);
 
-  // Get Trader Joe V2.2 LB Pair (Liquidity Book)
-  tjLBPair = await getLBPairContract(
-    tjLBFactory,
+  tjPair = await getPairContract(
+    tjFactory,
     token0.address,
     token1.address,
     provider
   );
-
-  // Get Pangolin V2 Pair (Traditional AMM)
   pPair = await getPairContract(
     pFactory,
     token0.address,
@@ -56,15 +48,14 @@ const main = async () => {
     provider
   );
 
-  console.log(`Trader Joe LB Pair Address: ${tjLBPair.address}`);
+  console.log(`Trader Joe V2 Pair Address: ${tjPair.address}`);
   console.log(`Pangolin Pair Address: ${pPair.address}\n`);
 
-  // Monitor Trader Joe LB events
-  tjLBPair.on("Swap", async () => {
+  tjPair.on("Swap", async () => {
     if (!isExecuting) {
       isExecuting = true;
 
-      const priceDifference = await checkPrice("Trader Joe LB", token0, token1);
+      const priceDifference = await checkPrice("Trader Joe V2", token0, token1);
       const routerPath = await determineDirection(priceDifference);
 
       if (!routerPath) {
@@ -98,7 +89,6 @@ const main = async () => {
     }
   });
 
-  // Monitor Pangolin V2 events
   pPair.on("Swap", async () => {
     if (!isExecuting) {
       isExecuting = true;
@@ -147,9 +137,7 @@ const checkPrice = async (exchange, token0, token1) => {
 
   const currentBlock = await provider.getBlockNumber();
 
-  // Get Trader Joe LB price
-  const tjPrice = await getLBPrice(tjLBPair);
-  // Get Pangolin V2 price
+  const tjPrice = await calculatePrice(tjPair);
   const pPrice = await calculatePrice(pPair);
 
   const tjFPrice = Number(tjPrice).toFixed(units);
@@ -159,7 +147,7 @@ const checkPrice = async (exchange, token0, token1) => {
   console.log(`Current Block: ${currentBlock}`);
   console.log(`-----------------------------------------`);
   console.log(
-    `TRADER JOE LB | ${token1.symbol}/${token0.symbol}\t | ${tjFPrice}`
+    `TRADER JOE V2 | ${token1.symbol}/${token0.symbol}\t | ${tjFPrice}`
   );
   console.log(
     `PANGOLIN V2   | ${token1.symbol}/${token0.symbol}\t | ${pFPrice}\n`
@@ -174,14 +162,14 @@ const determineDirection = async (priceDifference) => {
 
   if (priceDifference >= difference) {
     console.log(`Potential Arbitrage Direction:\n`);
-    console.log(`Buy\t -->\t Trader Joe LB`);
+    console.log(`Buy\t -->\t Trader Joe V2`);
     console.log(`Sell\t -->\t Pangolin\n`);
-    return [tjLBRouter, pRouter, "TJ_TO_P"];
+    return [tjRouter, pRouter];
   } else if (priceDifference <= -difference) {
     console.log(`Potential Arbitrage Direction:\n`);
     console.log(`Buy\t -->\t Pangolin`);
-    console.log(`Sell\t -->\t Trader Joe LB\n`);
-    return [pRouter, tjLBRouter, "P_TO_TJ"];
+    console.log(`Sell\t -->\t Trader Joe V2\n`);
+    return [pRouter, tjRouter];
   } else {
     return null;
   }
@@ -196,19 +184,18 @@ const determineProfitability = async (
   console.log(`Determining Profitability...\n`);
 
   let reserves, exchangeToBuy, exchangeToSell;
-  const direction = _routerPath[2];
 
-  if (direction === "TJ_TO_P") {
+  if (_routerPath[0].address == tjRouter.address) {
     reserves = await getReserves(pPair);
-    exchangeToBuy = "Trader Joe LB";
+    exchangeToBuy = "Trader Joe V2";
     exchangeToSell = "Pangolin";
   } else {
-    reserves = await getReserves(pPair); // We still use Pangolin reserves as reference
+    reserves = await getReserves(tjPair);
     exchangeToBuy = "Pangolin";
-    exchangeToSell = "Trader Joe LB";
+    exchangeToSell = "Trader Joe V2";
   }
 
-  console.log(`Reserves on Pangolin (reference)`);
+  console.log(`Reserves on ${exchangeToSell}`);
   console.log(
     `USDC: ${Number(
       ethers.utils.formatUnits(reserves[0].toString(), "mwei") // USDC has 6 decimals
@@ -219,74 +206,45 @@ const determineProfitability = async (
   );
 
   try {
-    let result;
-    let token0In, token1In;
+    let result = await _routerPath[0].getAmountsIn(reserves[0], [
+      _token0.address,
+      _token1.address,
+    ]);
 
-    if (direction === "TJ_TO_P") {
-      // Use LB simulation for first trade, V2 for second
-      const { amountIn, amountOut } = await simulateLB(
-        reserves[0], // Use USDC amount from Pangolin
-        _routerPath,
-        _token0,
-        _token1,
-        direction
-      );
+    const token0In = result[0]; // WAVAX
+    const token1In = result[1]; // USDC
 
-      token0In = amountIn;
+    result = await _routerPath[1].getAmountsOut(token1In, [
+      _token1.address,
+      _token0.address,
+    ]);
 
-      console.log(
-        `Estimated amount of WAVAX needed to buy USDC on ${exchangeToBuy}\t\t| ${ethers.utils.formatUnits(
-          token0In,
-          "ether"
-        )}`
-      );
-      console.log(
-        `Estimated amount of WAVAX returned after swapping USDC on ${exchangeToSell}\t| ${ethers.utils.formatUnits(
-          amountOut,
-          "ether"
-        )}\n`
-      );
+    console.log(
+      `Estimated amount of WAVAX needed to buy enough USDC on ${exchangeToBuy}\t\t| ${ethers.utils.formatUnits(
+        token0In,
+        "ether"
+      )}`
+    );
+    console.log(
+      `Estimated amount of WAVAX returned after swapping USDC on ${exchangeToSell}\t| ${ethers.utils.formatUnits(
+        result[1],
+        "ether"
+      )}\n`
+    );
 
-      amount = token0In;
+    const { amountIn, amountOut } = await simulate(
+      token0In,
+      _routerPath,
+      _token0,
+      _token1
+    );
 
-      if (amountOut <= amountIn) {
-        return false;
-      }
-
-      return true;
-    } else {
-      // Use V2 simulation for first trade, LB for second
-      const { amountIn, amountOut } = await simulateLB(
-        reserves[0], // Use USDC amount from Pangolin
-        _routerPath,
-        _token0,
-        _token1,
-        direction
-      );
-
-      token0In = amountIn;
-
-      console.log(
-        `Estimated amount of WAVAX needed to buy USDC on ${exchangeToBuy}\t\t| ${ethers.utils.formatUnits(
-          token0In,
-          "ether"
-        )}`
-      );
-      console.log(
-        `Estimated amount of WAVAX returned after swapping USDC on ${exchangeToSell}\t| ${ethers.utils.formatUnits(
-          amountOut,
-          "ether"
-        )}\n`
-      );
-
-      amount = token0In;
-
-      if (amountOut <= amountIn) {
-        return false;
-      }
-
-      return true;
+    if (amountOut < amountIn) {
+      return false;
     }
+
+    amount = token0In;
+    return true;
   } catch (error) {
     console.log(error);
     console.log(
@@ -302,10 +260,9 @@ const determineProfitability = async (
 const executeTrade = async (_routerPath, _token0Contract, _token1Contract) => {
   console.log(`Attempting Arbitrage...\n`);
 
-  const direction = _routerPath[2];
   let startOnTraderJoe;
 
-  if (direction === "TJ_TO_P") {
+  if (_routerPath[0].address == tjRouter.address) {
     startOnTraderJoe = true;
   } else {
     startOnTraderJoe = false;

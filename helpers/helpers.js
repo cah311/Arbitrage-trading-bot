@@ -33,17 +33,20 @@ async function getTokenAndContract(_token0Address, _token1Address, _provider) {
 
   const token0 = {
     address: _token0Address,
-    decimals: 18,
+    decimals: await token0Contract.decimals(),
     symbol: await token0Contract.symbol(),
     name: await token0Contract.name(),
   };
 
   const token1 = {
     address: _token1Address,
-    decimals: await token1Contract.decimals(), // Get actual decimals for USDC (6)
+    decimals: await token1Contract.decimals(),
     symbol: await token1Contract.symbol(),
     name: await token1Contract.name(),
   };
+
+  console.log(`Token0: ${token0.symbol} (${token0.decimals} decimals)`);
+  console.log(`Token1: ${token1.symbol} (${token1.decimals} decimals)`);
 
   return { token0Contract, token1Contract, token0, token1 };
 }
@@ -98,7 +101,45 @@ async function getLBPrice(_lbPairContract) {
 
 async function calculatePrice(_pairContract) {
   const [x, y] = await getReserves(_pairContract);
-  return Big(x).div(Big(y));
+
+  // DEBUG LOGGING:
+  console.log(`Debug - Reserve X: ${x.toString()}`);
+  console.log(`Debug - Reserve Y: ${y.toString()}`);
+  console.log(`Debug - Pair address: ${_pairContract.address}`);
+
+  // GET TOKEN DECIMALS TO NORMALIZE
+  const token0 = await _pairContract.token0();
+  const token1 = await _pairContract.token1();
+
+  const token0Contract = new ethers.Contract(
+    token0,
+    IERC20.abi,
+    _pairContract.provider
+  );
+  const token1Contract = new ethers.Contract(
+    token1,
+    IERC20.abi,
+    _pairContract.provider
+  );
+
+  const decimals0 = await token0Contract.decimals();
+  const decimals1 = await token1Contract.decimals();
+
+  console.log(
+    `Debug - Token0 decimals: ${decimals0}, Token1 decimals: ${decimals1}`
+  );
+
+  // NORMALIZE FOR DECIMALS
+  const normalizedX = Big(x.toString()).div(Big(10).pow(decimals0));
+  const normalizedY = Big(y.toString()).div(Big(10).pow(decimals1));
+
+  const price = normalizedX.div(normalizedY);
+
+  console.log(`Debug - Normalized X: ${normalizedX.toString()}`);
+  console.log(`Debug - Normalized Y: ${normalizedY.toString()}`);
+  console.log(`Debug - Calculated price: ${price.toString()}`);
+
+  return price;
 }
 
 async function calculateDifference(_uPrice, _sPrice) {
