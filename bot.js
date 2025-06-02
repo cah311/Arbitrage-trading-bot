@@ -51,7 +51,14 @@ const main = async () => {
   console.log(`Trader Joe V2 Pair Address: ${tjPair.address}`);
   console.log(`Pangolin Pair Address: ${pPair.address}\n`);
 
+  // Add periodic heartbeat to show the bot is alive
+  setInterval(() => {
+    const now = new Date().toLocaleTimeString();
+    console.log(`[${now}] Bot active - monitoring for swaps...`);
+  }, 60000); // Every 60 seconds
+
   tjPair.on("Swap", async () => {
+    console.log("🔥 TRADER JOE SWAP DETECTED!"); // Debug log
     if (!isExecuting) {
       isExecuting = true;
 
@@ -90,6 +97,7 @@ const main = async () => {
   });
 
   pPair.on("Swap", async () => {
+    console.log("🟢 PANGOLIN SWAP DETECTED!"); // Debug log
     if (!isExecuting) {
       isExecuting = true;
 
@@ -161,15 +169,19 @@ const determineDirection = async (priceDifference) => {
   console.log(`Determining Direction...\n`);
 
   if (priceDifference >= difference) {
+    // Trader Joe is MORE expensive than Pangolin
+    // So: Buy cheap (Pangolin), Sell expensive (Trader Joe)
     console.log(`Potential Arbitrage Direction:\n`);
-    console.log(`Buy\t -->\t Trader Joe V2`);
-    console.log(`Sell\t -->\t Pangolin\n`);
-    return [tjRouter, pRouter];
+    console.log(`Buy\t -->\t Pangolin`); // ✅ Buy cheap
+    console.log(`Sell\t -->\t Trader Joe V2\n`); // ✅ Sell expensive
+    return [pRouter, tjRouter]; // ✅ FIXED: Pangolin first, then Trader Joe
   } else if (priceDifference <= -difference) {
+    // Pangolin is MORE expensive than Trader Joe
+    // So: Buy cheap (Trader Joe), Sell expensive (Pangolin)
     console.log(`Potential Arbitrage Direction:\n`);
-    console.log(`Buy\t -->\t Pangolin`);
-    console.log(`Sell\t -->\t Trader Joe V2\n`);
-    return [pRouter, tjRouter];
+    console.log(`Buy\t -->\t Trader Joe V2`); // ✅ Buy cheap
+    console.log(`Sell\t -->\t Pangolin\n`); // ✅ Sell expensive
+    return [tjRouter, pRouter]; // ✅ FIXED: Trader Joe first, then Pangolin
   } else {
     return null;
   }
@@ -206,7 +218,50 @@ const determineProfitability = async (
   );
 
   try {
-    let result = await _routerPath[0].getAmountsIn(reserves[0], [
+    // Get actual price difference from the swap event
+    const tjPrice = await calculatePrice(tjPair);
+    const pPrice = await calculatePrice(pPair);
+    const actualPriceDiff =
+      (Math.abs(Number(tjPrice) - Number(pPrice)) / Number(pPrice)) * 100;
+
+    console.log(`Actual price difference: ${actualPriceDiff.toFixed(3)}%`);
+
+    // Dynamic trade sizing based on available liquidity and price difference
+    let targetUSDC;
+    const sellExchangeUSDC = Number(
+      ethers.utils.formatUnits(reserves[0].toString(), "mwei")
+    );
+
+    // Use smaller sizes for better execution and lower slippage
+    if (actualPriceDiff >= 1.0) {
+      targetUSDC = Math.min(1000, sellExchangeUSDC * 0.02); // Max 2% of pool
+    } else if (actualPriceDiff >= 0.75) {
+      targetUSDC = Math.min(600, sellExchangeUSDC * 0.015); // Max 1.5% of pool
+    } else if (actualPriceDiff >= 0.5) {
+      targetUSDC = Math.min(300, sellExchangeUSDC * 0.01); // Max 1% of pool
+    } else if (actualPriceDiff >= 0.3) {
+      targetUSDC = Math.min(150, sellExchangeUSDC * 0.005); // Max 0.5% of pool
+    } else {
+      return false; // Don't trade if < 0.30%
+    }
+
+    // Additional constraint: never trade more than 2% of the smaller pool
+    const minPoolUSDC = Math.min(
+      Number(ethers.utils.formatUnits(reserves[0].toString(), "mwei")),
+      sellExchangeUSDC
+    );
+    targetUSDC = Math.min(targetUSDC, minPoolUSDC * 0.02);
+
+    console.log(
+      `Dynamic target amount: ${targetUSDC.toFixed(2)} USDC (${(
+        (targetUSDC / sellExchangeUSDC) *
+        100
+      ).toFixed(3)}% of pool)`
+    );
+
+    const targetAmount = ethers.utils.parseUnits(targetUSDC.toString(), "mwei");
+
+    let result = await _routerPath[0].getAmountsIn(targetAmount, [
       _token0.address,
       _token1.address,
     ]);
@@ -220,7 +275,13 @@ const determineProfitability = async (
     ]);
 
     console.log(
-      `Estimated amount of WAVAX needed to buy enough USDC on ${exchangeToBuy}\t\t| ${ethers.utils.formatUnits(
+      `Target amount (dynamic): ${ethers.utils.formatUnits(
+        targetAmount,
+        "mwei"
+      )} USDC`
+    );
+    console.log(
+      `Estimated amount of WAVAX needed to buy target USDC on ${exchangeToBuy}\t\t| ${ethers.utils.formatUnits(
         token0In,
         "ether"
       )}`
@@ -239,10 +300,30 @@ const determineProfitability = async (
       _token1
     );
 
-    if (amountOut < amountIn) {
+    console.log(
+      `Profit simulation: Input ${amountIn} WAVAX, Output ${amountOut} WAVAX`
+    );
+    console.log(`Net result: ${(amountOut - amountIn).toFixed(6)} WAVAX\n`);
+
+    // Account for gas costs (estimate ~0.003 WAVAX per transaction)
+    const estimatedGasCost = 0.006; // 2 transactions * 0.003 WAVAX each
+    const netProfitAfterGas = amountOut - amountIn - estimatedGasCost;
+
+    console.log(`Estimated gas cost: ${estimatedGasCost} WAVAX`);
+    console.log(`Net profit after gas: ${netProfitAfterGas.toFixed(6)} WAVAX`);
+
+    if (netProfitAfterGas <= 0) {
+      console.log(
+        `❌ Not profitable: Loss/break-even of ${Math.abs(
+          netProfitAfterGas
+        ).toFixed(6)} WAVAX after gas`
+      );
       return false;
     }
 
+    console.log(
+      `✅ Profitable: Profit of ${netProfitAfterGas.toFixed(6)} WAVAX after gas`
+    );
     amount = token0In;
     return true;
   } catch (error) {
